@@ -1,8 +1,0 @@
-*.csv
-venv/
-.venv/
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-catboost_info/
-.DS_Store
