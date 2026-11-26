@@ -35,9 +35,10 @@ def main():
     # XGBoost input
     X_xgb = X_base.copy()
     for c in bool_cols:
-        X_xgb[c] = X_xgb[c].astype("boolean")
+        X_xgb[c] = pd.to_numeric(X_xgb[c], errors="coerce").astype("float32")
     for c in cat_cols:
-        X_xgb[c] = pd.Categorical(X_xgb[c], categories=xgb_cats[c])
+        s = X_xgb[c].dropna().astype(str).reindex(X_xgb.index)
+        X_xgb[c] = pd.Categorical(s, categories=xgb_cats[c])
     for c in features:
         if c not in bool_cols and c not in cat_cols:
             X_xgb[c] = pd.to_numeric(X_xgb[c], errors="coerce").astype("float32")
