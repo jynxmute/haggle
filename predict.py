@@ -1,66 +1,55 @@
-"""Hour Detective (Hack Club Haggle): Fast inference from pre-trained CatBoost + XGBoost models."""
+"""Hour Detective (Hack Club Haggle): 10-Fold Stacked Ensemble."""
 import json
 from pathlib import Path
+import joblib
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor
-from xgboost import XGBRegressor
 
 
 def main():
     test = pd.read_csv("test.csv")
-    model_dir = Path("models")
-    meta = json.loads((model_dir / "meta.json").read_text())
+    mdir = Path("models_v2")
+    cfg = json.loads((mdir / "config.json").read_text())
 
-    features = meta["features"]
-    cat_cols = meta["cat_cols"]
-    bool_cols = meta["bool_cols"]
-    xgb_cats = meta["xgb_cats"]
-    n_models = meta["n_models"]
-    w_cb7, w_cb8, w_xgb = meta["weights"]
+    keep_feats = cfg["keep_feats"]
+    cat_cols = cfg["cat_cols"]
+    bool_cols = cfg["bool_cols"]
+    num_cols = cfg["num_cols"]
 
-    X_base = test.reindex(columns=features).copy()
-
-    # CatBoost input
-    X_cb = X_base.copy()
-    for c in features:
-        if c in bool_cols:
-            X_cb[c] = pd.to_numeric(X_cb[c], errors="coerce").astype("float32")
-        elif c in cat_cols:
-            fill_v = "other" if c == "project_category" else ""
-            X_cb[c] = X_cb[c].fillna(fill_v).astype(str)
-        else:
-            X_cb[c] = pd.to_numeric(X_cb[c], errors="coerce").astype("float32")
-
-    # XGBoost input
-    X_xgb = X_base.copy()
-    for c in bool_cols:
-        X_xgb[c] = pd.to_numeric(X_xgb[c], errors="coerce").astype("float32")
+    X_cb = test.reindex(columns=keep_feats).copy()
+    for c in bool_cols + num_cols:
+        X_cb[c] = pd.to_numeric(X_cb[c], errors="coerce").astype("float32")
     for c in cat_cols:
-        s = X_xgb[c].dropna().astype(str).reindex(X_xgb.index)
-        X_xgb[c] = pd.Categorical(s, categories=xgb_cats[c])
-    for c in features:
-        if c not in bool_cols and c not in cat_cols:
-            X_xgb[c] = pd.to_numeric(X_xgb[c], errors="coerce").astype("float32")
+        fill_v = "other" if c == "project_category" else ""
+        X_cb[c] = X_cb[c].fillna(fill_v).astype(str)
 
-    p_cb7 = np.zeros(len(test))
-    p_cb8 = np.zeros(len(test))
-    p_xgb = np.zeros(len(test))
+    X_lgb = X_cb.copy()
+    for c in cat_cols:
+        X_lgb[c] = X_lgb[c].astype("category")
 
-    for i in range(n_models):
-        m7 = CatBoostRegressor()
-        m7.load_model(str(model_dir / f"cb7_{i}.cbm"))
-        p_cb7 += m7.predict(X_cb) / n_models
+    p1 = np.zeros(len(test))
+    p2 = np.zeros(len(test))
+    p3 = np.zeros(len(test))
+    p4 = np.zeros(len(test))
 
-        m8 = CatBoostRegressor()
-        m8.load_model(str(model_dir / f"cb8_{i}.cbm"))
-        p_cb8 += m8.predict(X_cb) / n_models
+    for fold in range(10):
+        m1 = CatBoostRegressor()
+        m1.load_model(str(mdir / f"cb_rmse_{fold}.cbm"))
+        p1 += m1.predict(X_cb) / 10.0
 
-        mx = XGBRegressor()
-        mx.load_model(str(model_dir / f"xgb_{i}.json"))
-        p_xgb += mx.predict(X_xgb) / n_models
+        m2 = CatBoostRegressor()
+        m2.load_model(str(mdir / f"cb_huber_{fold}.cbm"))
+        p2 += m2.predict(X_cb) / 10.0
 
-    log_pred = w_cb7 * p_cb7 + w_cb8 * p_cb8 + w_xgb * p_xgb
+        m3 = joblib.load(mdir / f"lgb_{fold}.pkl")
+        p3 += m3.predict(X_lgb) / 10.0
+
+        m4 = joblib.load(mdir / f"mlp_{fold}.pkl")
+        p4 += m4.predict(X_cb) / 10.0
+
+    meta = joblib.load(mdir / "meta_stacker.pkl")
+    log_pred = meta.predict(np.column_stack([p1, p2, p3, p4]))
     preds = np.maximum(0.05, np.expm1(log_pred))
 
     pd.DataFrame({
