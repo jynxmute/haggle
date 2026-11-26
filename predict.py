@@ -1,66 +1,66 @@
-"""Hour Detective (Hack Club Haggle): Multi-depth (d7 + d8) raw-feature CatBoost ensemble."""
+"""Hour Detective (Hack Club Haggle): Fast inference from pre-trained CatBoost + XGBoost models."""
+import json
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor
-from sklearn.model_selection import StratifiedKFold
-
-DROP = ["project_id", "hours_spent", "log_hours", "hours_bucket"]
-SEEDS = (42, 2026)
-
-
-def prepare_data(train_df, test_df):
-    features = [c for c in train_df.columns if c not in DROP]
-    X_tr = train_df[features].copy()
-    X_te = test_df.reindex(columns=features).copy()
-
-    cat_cols = []
-    for c in features:
-        if X_tr[c].dtype == bool or str(X_tr[c].dtype) == "boolean":
-            X_tr[c] = X_tr[c].astype("float32")
-            X_te[c] = pd.to_numeric(X_te[c], errors="coerce").astype("float32")
-        elif not pd.api.types.is_numeric_dtype(X_tr[c]):
-            cat_cols.append(c)
-            fill_val = "other" if c == "project_category" else ""
-            X_tr[c] = X_tr[c].fillna(fill_val).astype(str)
-            X_te[c] = X_te[c].fillna    (fill_val).astype(str)
-        else:
-            X_tr[c] = pd.to_numeric(X_tr[c], errors="coerce").astype("float32")
-            X_te[c] = pd.to_numeric(X_te[c], errors="coerce").astype("float32")
-
-    return X_tr, X_te, cat_cols
+from xgboost import XGBRegressor
 
 
 def main():
-    train = pd.read_csv("train.csv")
     test = pd.read_csv("test.csv")
-    y = np.log1p(train["hours_spent"].values)
-    strata = train["hours_bucket"].fillna("unk").astype(str)
+    model_dir = Path("models")
+    meta = json.loads((model_dir / "meta.json").read_text())
 
-    X_tr, X_te, cat_cols = prepare_data(train, test)
+    features = meta["features"]
+    cat_cols = meta["cat_cols"]
+    bool_cols = meta["bool_cols"]
+    xgb_cats = meta["xgb_cats"]
+    n_models = meta["n_models"]
+    w_cb7, w_cb8, w_xgb = meta["weights"]
 
-    configs = [
-        dict(iterations=2000, learning_rate=0.015, depth=7, l2_leaf_reg=4.0, subsample=0.8, bootstrap_type="Bernoulli"),
-        dict(iterations=2000, learning_rate=0.015, depth=8, l2_leaf_reg=6.0, subsample=0.8, bootstrap_type="Bernoulli"),
-    ]
+    X_base = test.reindex(columns=features).copy()
 
-    cat_preds = np.zeros(len(test))
-    n_models = len(SEEDS) * 5 * len(configs)
+    # CatBoost input
+    X_cb = X_base.copy()
+    for c in features:
+        if c in bool_cols:
+            X_cb[c] = pd.to_numeric(X_cb[c], errors="coerce").astype("float32")
+        elif c in cat_cols:
+            fill_v = "other" if c == "project_category" else ""
+            X_cb[c] = X_cb[c].fillna(fill_v).astype(str)
+        else:
+            X_cb[c] = pd.to_numeric(X_cb[c], errors="coerce").astype("float32")
 
-    for seed in SEEDS:
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
-        for fold, (tr_i, _) in enumerate(skf.split(X_tr, strata)):
-            for cfg_i, params in enumerate(configs):
-                cb = CatBoostRegressor(
-                    **params,
-                    cat_features=cat_cols,
-                    random_seed=seed + fold * 10 + cfg_i,
-                    verbose=0,
-                    allow_writing_files=False,
-                )
-                cb.fit(X_tr.iloc[tr_i], y[tr_i])
-                cat_preds += cb.predict(X_te) / n_models
+    # XGBoost input
+    X_xgb = X_base.copy()
+    for c in bool_cols:
+        X_xgb[c] = X_xgb[c].astype("boolean")
+    for c in cat_cols:
+        X_xgb[c] = pd.Categorical(X_xgb[c], categories=xgb_cats[c])
+    for c in features:
+        if c not in bool_cols and c not in cat_cols:
+            X_xgb[c] = pd.to_numeric(X_xgb[c], errors="coerce").astype("float32")
 
-    preds = np.maximum(0.05, np.expm1(cat_preds))
+    p_cb7 = np.zeros(len(test))
+    p_cb8 = np.zeros(len(test))
+    p_xgb = np.zeros(len(test))
+
+    for i in range(n_models):
+        m7 = CatBoostRegressor()
+        m7.load_model(str(model_dir / f"cb7_{i}.cbm"))
+        p_cb7 += m7.predict(X_cb) / n_models
+
+        m8 = CatBoostRegressor()
+        m8.load_model(str(model_dir / f"cb8_{i}.cbm"))
+        p_cb8 += m8.predict(X_cb) / n_models
+
+        mx = XGBRegressor()
+        mx.load_model(str(model_dir / f"xgb_{i}.json"))
+        p_xgb += mx.predict(X_xgb) / n_models
+
+    log_pred = w_cb7 * p_cb7 + w_cb8 * p_cb8 + w_xgb * p_xgb
+    preds = np.maximum(0.05, np.expm1(log_pred))
 
     pd.DataFrame({
         "project_id": test["project_id"],
