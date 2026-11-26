@@ -1,14 +1,8 @@
-# data (never upload train.csv) and generated output
 *.csv
-
-# Python environments and caches
 venv/
 .venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-
-# CatBoost log folder
 catboost_info/
-
 .DS_Store
